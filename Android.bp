@@ -38,6 +38,7 @@ android_library {
         "com.google.android.material_material",
         "SettingsLib",
         "SettingsLibSliderPreference",
+        "IGlyphService-java",
     ],
 }
 
@@ -56,6 +57,7 @@ android_app {
     required: [
         "privapp_whitelist_co.aospa.glyph.xml",
         "whitelist_co.aospa.glyph.xml",
+        "GlyphAdapter",
     ],
 }
 
@@ -74,6 +76,7 @@ android_app {
     required: [
         "privapp_whitelist_co.aospa.glyph.xml",
         "whitelist_co.aospa.glyph.xml",
+        "GlyphAdapter",
     ],
 }
 
