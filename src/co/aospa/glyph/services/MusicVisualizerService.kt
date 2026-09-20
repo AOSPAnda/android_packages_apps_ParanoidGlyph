@@ -63,7 +63,7 @@ private class BandState {
             .average()
         if (value > ceiling) ceiling = value
 
-        if (value >= ceiling * config.triggerRatio) {
+        if (ceiling > 0 && value >= ceiling * config.triggerRatio) {
             brightness = 1.0
             lastBeatTime = now
         } else {
@@ -90,7 +90,7 @@ private fun List<AudioPlaybackConfiguration>.activeSessionId() =
  * between beats instead of a fixed-length flash.
  */
 class MusicVisualizerService : Service() {
-    private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
+    private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO.limitedParallelism(1))
     private val audioManager by lazy { getSystemService(AudioManager::class.java) }
     private var visualizer: Visualizer? = null
     private var sessionId: Int? = null
@@ -129,6 +129,7 @@ class MusicVisualizerService : Service() {
         audioManager.unregisterAudioPlaybackCallback(playbackCallback)
         releaseVisualizer()
         scope.cancel()
+        AnimationManager.updateLedFrame(IntArray(bands.size))
         super.onDestroy()
     }
 
@@ -140,6 +141,7 @@ class MusicVisualizerService : Service() {
         sessionId = newSessionId
         visualizer = Visualizer(newSessionId).apply {
             captureSize = Visualizer.getCaptureSizeRange()[1]
+            scalingMode = Visualizer.SCALING_MODE_AS_PLAYED
             setDataCaptureListener(dataCaptureListener, Visualizer.getMaxCaptureRate(), false, true)
             enabled = true
         }
