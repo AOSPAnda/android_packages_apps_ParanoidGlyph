@@ -25,6 +25,11 @@ private const val FFT_BUCKETS = 100
 private const val NOISE_FLOOR = 10.0f
 private const val NORMALIZE_DIVISOR = 195.0
 private const val NORMALIZE_SCALE = 2.5
+private const val MIN_BAND_ENERGY = 0.02
+private const val SILENCE_RMS_MB = -6000
+private const val SIGNAL_RMS_MB = -5700
+private const val SIGNAL_CONFIRMATION_FRAMES = 3
+private const val SILENCE_CONFIRMATION_FRAMES = 5
 
 /** One band's FFT bucket range and its adaptive trigger/decay tuning. */
 private data class BandConfig(
@@ -34,16 +39,15 @@ private data class BandConfig(
     val triggerRatio: Double,
     val triggerDecay: Double,
     val ceilingDecay: Double,
-    val ceilingFloor: Double,
 )
 
 /** Nothing's AudioReactiveGlyph tuning, 5-channel config. */
 private val BAND_CONFIGS = listOf(
-    BandConfig(8, 4, 1000, 0.75, 0.56, 0.65, 0.5),
-    BandConfig(15, 8, 500, 0.7, 0.66, 0.65, 0.5),
-    BandConfig(0, 1, 300, 0.75, 0.56, 0.95, 0.75),
-    BandConfig(30, 15, 200, 0.7, 0.66, 0.63, 0.5),
-    BandConfig(55, 20, 100, 0.7, 0.66, 0.63, 0.5),
+    BandConfig(8, 4, 1000, 0.75, 0.56, 0.65),
+    BandConfig(15, 8, 500, 0.7, 0.66, 0.65),
+    BandConfig(0, 1, 300, 0.75, 0.56, 0.95),
+    BandConfig(30, 15, 200, 0.7, 0.66, 0.63),
+    BandConfig(55, 20, 100, 0.7, 0.66, 0.63),
 )
 
 private class BandState {
@@ -58,23 +62,29 @@ private class BandState {
         brightness = 0.0
     }
 
-    fun update(buckets: DoubleArray, config: BandConfig, now: Long) {
-        val value = buckets.slice(config.bucketStart until config.bucketStart + config.bucketCount)
-            .average()
+    fun update(value: Double, config: BandConfig, now: Long) {
         if (value > ceiling) ceiling = value
 
-        if (ceiling > 0 && value >= ceiling * config.triggerRatio) {
+        if (value > MIN_BAND_ENERGY && value >= ceiling * config.triggerRatio) {
             brightness = 1.0
             lastBeatTime = now
         } else {
-            brightness *= config.triggerDecay
+            decayBrightness(config)
         }
-        if (brightness < 0.05) brightness = 0.0
 
-        if (now - lastBeatTime > config.decayWindowMs) {
-            val decayed = ceiling * config.ceilingDecay
-            if (decayed > ceiling * config.ceilingFloor) ceiling = decayed
+        if (now - lastBeatTime > config.decayWindowMs &&
+            value < ceiling * config.triggerRatio
+        ) {
+            ceiling = maxOf(
+                ceiling * config.ceilingDecay,
+                MIN_BAND_ENERGY / config.triggerRatio,
+            )
         }
+    }
+
+    fun decayBrightness(config: BandConfig) {
+        brightness *= config.triggerDecay
+        if (brightness < 0.05) brightness = 0.0
     }
 }
 
@@ -89,7 +99,8 @@ private fun List<AudioPlaybackConfiguration>.activeMediaSessionId(): Int? =
  *
  * Each band tracks its own adaptive peak, so a beat is a value clearing a fraction of that
  * band's recent ceiling rather than a fixed threshold, and brightness decays exponentially
- * between beats instead of a fixed-length flash.
+ * between beats instead of a fixed-length flash. FFT captures are volume-normalized while the
+ * unscaled RMS level gates silence and quiet track endings.
  */
 class MusicVisualizerService : Service() {
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO.limitedParallelism(1))
@@ -98,6 +109,9 @@ class MusicVisualizerService : Service() {
     private var sessionId: Int? = null
 
     private val bands = List(BAND_CONFIGS.size) { BandState() }
+    private val measurement = Visualizer.MeasurementPeakRms()
+    private var signalPresent = false
+    private var signalConfirmationFrames = 0
     private var wasSilent = true
 
     private val dataCaptureListener = object : Visualizer.OnDataCaptureListener {
@@ -109,7 +123,7 @@ class MusicVisualizerService : Service() {
 
         override fun onFftDataCapture(visualizer: Visualizer, fft: ByteArray, samplingRate: Int) {
             if (visualizer !== this@MusicVisualizerService.visualizer) return
-            processFft(fft)
+            processFft(visualizer, fft)
         }
     }
 
@@ -159,7 +173,8 @@ class MusicVisualizerService : Service() {
                     if (this@MusicVisualizerService.visualizer === newVisualizer) releaseVisualizer()
                 }
                 captureSize = Visualizer.getCaptureSizeRange()[1]
-                scalingMode = Visualizer.SCALING_MODE_AS_PLAYED
+                scalingMode = Visualizer.SCALING_MODE_NORMALIZED
+                measurementMode = Visualizer.MEASUREMENT_MODE_PEAK_RMS
                 setDataCaptureListener(dataCaptureListener, Visualizer.getMaxCaptureRate(), false, true)
                 enabled = true
             }
@@ -173,6 +188,8 @@ class MusicVisualizerService : Service() {
         val releasedVisualizer = visualizer
         visualizer = null
         bands.forEach { it.reset() }
+        signalPresent = false
+        signalConfirmationFrames = 0
         wasSilent = true
         AnimationManager.updateLedFrame(IntArray(bands.size))
         try {
@@ -185,8 +202,50 @@ class MusicVisualizerService : Service() {
         }
     }
 
-    private fun processFft(fft: ByteArray) {
-        if (fft.all { it == 0.toByte() }) {
+    private fun processFft(visualizer: Visualizer, fft: ByteArray) {
+        val buckets = bucketMagnitudes(fft)
+        val bandEnergies = DoubleArray(BAND_CONFIGS.size) { i ->
+            val config = BAND_CONFIGS[i]
+            buckets.slice(config.bucketStart until config.bucketStart + config.bucketCount).average()
+        }
+        if (!hasAudibleSignal(visualizer) || bandEnergies.all { it <= MIN_BAND_ENERGY }) {
+            fadeToSilence()
+            return
+        }
+        wasSilent = false
+
+        val now = System.currentTimeMillis()
+        bands.forEachIndexed { i, state -> state.update(bandEnergies[i], BAND_CONFIGS[i], now) }
+
+        val maxBrightness = Constants.getMaxBrightness()
+        writeLedFrame(IntArray(bands.size) { i -> (bands[i].brightness * maxBrightness).toInt() })
+    }
+
+    private fun hasAudibleSignal(visualizer: Visualizer): Boolean {
+        if (visualizer.getMeasurementPeakRms(measurement) != Visualizer.SUCCESS) {
+            return signalPresent
+        }
+        val threshold = if (signalPresent) SILENCE_RMS_MB else SIGNAL_RMS_MB
+        val signalDetected = measurement.mRms > threshold
+        if (signalDetected == signalPresent) {
+            signalConfirmationFrames = 0
+        } else {
+            val confirmationFrames = if (signalDetected) {
+                SIGNAL_CONFIRMATION_FRAMES
+            } else {
+                SILENCE_CONFIRMATION_FRAMES
+            }
+            if (++signalConfirmationFrames >= confirmationFrames) {
+                signalPresent = signalDetected
+                signalConfirmationFrames = 0
+            }
+        }
+        return signalPresent
+    }
+
+    private fun fadeToSilence() {
+        bands.forEachIndexed { i, state -> state.decayBrightness(BAND_CONFIGS[i]) }
+        if (bands.all { it.brightness == 0.0 }) {
             if (!wasSilent) {
                 bands.forEach { it.reset() }
                 wasSilent = true
@@ -194,12 +253,8 @@ class MusicVisualizerService : Service() {
             }
             return
         }
+
         wasSilent = false
-
-        val buckets = bucketMagnitudes(fft)
-        val now = System.currentTimeMillis()
-        bands.forEachIndexed { i, state -> state.update(buckets, BAND_CONFIGS[i], now) }
-
         val maxBrightness = Constants.getMaxBrightness()
         writeLedFrame(IntArray(bands.size) { i -> (bands[i].brightness * maxBrightness).toInt() })
     }
@@ -220,7 +275,7 @@ class MusicVisualizerService : Service() {
                 val im = fft[idx + 1].toFloat()
                 sum += (sqrt(re * re + im * im) - NOISE_FLOOR).coerceAtLeast(0f)
             }
-            ((sum / binsPerBucket).coerceAtLeast(0f) / NORMALIZE_DIVISOR) * NORMALIZE_SCALE
+            (sum / binsPerBucket / NORMALIZE_DIVISOR) * NORMALIZE_SCALE
         }
     }
 }
