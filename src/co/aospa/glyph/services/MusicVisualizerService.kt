@@ -78,9 +78,11 @@ private class BandState {
     }
 }
 
-/** The active media playback's session ID, or the output mix if none is playing. */
-private fun List<AudioPlaybackConfiguration>.activeSessionId() =
-    firstOrNull { it.audioAttributes.usage == AudioAttributes.USAGE_MEDIA }?.sessionId ?: 0
+/** The active media playback's session ID, or null if none is playing. */
+private fun List<AudioPlaybackConfiguration>.activeMediaSessionId(): Int? =
+    firstOrNull {
+        it.audioAttributes.usage == AudioAttributes.USAGE_MEDIA && it.isActive
+    }?.sessionId
 
 /**
  * Drives the Glyph LEDs from the live output mix's FFT.
@@ -106,19 +108,20 @@ class MusicVisualizerService : Service() {
         ) {}
 
         override fun onFftDataCapture(visualizer: Visualizer, fft: ByteArray, samplingRate: Int) {
+            if (visualizer !== this@MusicVisualizerService.visualizer) return
             processFft(fft)
         }
     }
 
     private val playbackCallback = object : AudioManager.AudioPlaybackCallback() {
         override fun onPlaybackConfigChanged(configs: MutableList<AudioPlaybackConfiguration>) {
-            attachVisualizer(configs.activeSessionId())
+            updateVisualizer(configs.activeMediaSessionId())
         }
     }
 
     override fun onCreate() {
         audioManager.registerAudioPlaybackCallback(playbackCallback, null)
-        attachVisualizer(audioManager.activePlaybackConfigurations.activeSessionId())
+        updateVisualizer(audioManager.activePlaybackConfigurations.activeMediaSessionId())
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
@@ -129,31 +132,57 @@ class MusicVisualizerService : Service() {
         audioManager.unregisterAudioPlaybackCallback(playbackCallback)
         releaseVisualizer()
         scope.cancel()
-        AnimationManager.updateLedFrame(IntArray(bands.size))
         super.onDestroy()
     }
 
     override fun onBind(intent: Intent?): IBinder? = null
 
+    private fun updateVisualizer(activeSessionId: Int?) {
+        scope.launch {
+            if (activeSessionId == null) {
+                releaseVisualizer()
+            } else {
+                attachVisualizer(activeSessionId)
+            }
+        }
+    }
+
     private fun attachVisualizer(newSessionId: Int) {
-        if (newSessionId == sessionId) return
+        if (newSessionId == sessionId && visualizer != null) return
         releaseVisualizer()
         sessionId = newSessionId
-        visualizer = Visualizer(newSessionId).apply {
-            captureSize = Visualizer.getCaptureSizeRange()[1]
-            scalingMode = Visualizer.SCALING_MODE_AS_PLAYED
-            setDataCaptureListener(dataCaptureListener, Visualizer.getMaxCaptureRate(), false, true)
-            enabled = true
+        try {
+            val newVisualizer = Visualizer(newSessionId)
+            visualizer = newVisualizer
+            newVisualizer.apply {
+                setServerDiedListener {
+                    if (this@MusicVisualizerService.visualizer === newVisualizer) releaseVisualizer()
+                }
+                captureSize = Visualizer.getCaptureSizeRange()[1]
+                scalingMode = Visualizer.SCALING_MODE_AS_PLAYED
+                setDataCaptureListener(dataCaptureListener, Visualizer.getMaxCaptureRate(), false, true)
+                enabled = true
+            }
+        } catch (_: RuntimeException) {
+            releaseVisualizer()
         }
     }
 
     private fun releaseVisualizer() {
         sessionId = null
-        visualizer?.apply {
-            enabled = false
-            release()
-        }
+        val releasedVisualizer = visualizer
         visualizer = null
+        bands.forEach { it.reset() }
+        wasSilent = true
+        AnimationManager.updateLedFrame(IntArray(bands.size))
+        try {
+            releasedVisualizer?.apply {
+                enabled = false
+                release()
+            }
+        } catch (_: RuntimeException) {
+            // The audio server may already be unavailable.
+        }
     }
 
     private fun processFft(fft: ByteArray) {
