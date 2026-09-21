@@ -209,17 +209,18 @@ class MusicVisualizerService : Service() {
     }
 
     private fun bucketMagnitudes(fft: ByteArray): DoubleArray {
-        val length = (fft.size / 2) - 2
-        val chunk = length / FFT_BUCKETS
+        val numComplexBins = (fft.size / 2) - 1
+        val binsPerBucket = numComplexBins / FFT_BUCKETS
         return DoubleArray(FFT_BUCKETS) { i ->
             var sum = 0f
-            for (j in 0 until chunk step 2) {
-                val idx = 2 + (i * chunk) + j
+            for (j in 0 until binsPerBucket) {
+                val bin = 1 + (i * binsPerBucket) + j
+                val idx = bin * 2
                 val re = fft[idx].toFloat()
                 val im = fft[idx + 1].toFloat()
                 sum += (sqrt(re * re + im * im) - NOISE_FLOOR).coerceAtLeast(0f)
             }
-            ((sum / (chunk / 2.0f)).coerceAtLeast(0f) / NORMALIZE_DIVISOR) * NORMALIZE_SCALE
+            ((sum / binsPerBucket).coerceAtLeast(0f) / NORMALIZE_DIVISOR) * NORMALIZE_SCALE
         }
     }
 }
